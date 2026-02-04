@@ -1,0 +1,37 @@
+services:
+  init:
+    working_dir: /var/ansible/project
+    volumes:
+    - ./:/var/ansible/project
+    image: "ghcr.io/aursu/rockylinux:${RL10TAG}-ansible"
+    command: ansible-galaxy collection init --force ${NAMESPACE}.${COLLECTION}
+  tests:
+    working_dir: /var/ansible/project
+    volumes:
+    - ./:/var/ansible/project
+    image: "ghcr.io/aursu/rockylinux:${RL10TAG}-ansible"
+    command: pytest -v tests/unit
+  build:
+    working_dir: /var/ansible/project
+    volumes:
+    - ./:/var/ansible/project
+    image: "ghcr.io/aursu/rockylinux:${RL10TAG}-ansible"
+    command: ansible-galaxy collection build
+  publish:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        rocky: ${RL10}
+    volumes:
+    - ./:/var/ansible/project
+    environment:
+      - VERSION
+      - NAMESPACE
+      - COLLECTION
+    secrets:
+      - galaxy_token
+
+secrets:
+  galaxy_token:
+    file: ${HOME}/.ansible/galaxy_token
