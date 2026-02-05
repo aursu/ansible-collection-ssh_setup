@@ -79,6 +79,127 @@ diff:
   type: list
 """
 
+class SshLine:
+    """
+    Базовый класс и Фабрика.
+    """
+    def __init__(self, raw_content):
+        self.raw = raw_content
+        self.modified = False
+        self._diff_info = None
+
+    def render(self):
+        return self.raw
+
+    @property
+    def diff(self):
+        return self._diff_info
+
+    @classmethod
+    def create(cls, raw_line):
+        """
+        Фабричный метод. Анализирует строку и возвращает экземпляр правильного подкласса.
+        """
+        stripped = raw_line.strip()
+
+        # 1. Быстрая проверка на мусор (комментарии, пустые строки)
+        if not stripped or stripped.startswith('#'):
+            return IgnoredLine(raw_line)
+
+        # 2. Пробуем распарсить структуру (чтобы определить тип)
+        try:
+            parts = shlex.split(stripped)
+        except ValueError:
+            # Если кавычки не закрыты или мусор — считаем Ignored, не ломаем скрипт
+            return IgnoredLine(raw_line)
+
+        if not parts:
+            return IgnoredLine(raw_line)
+
+        first_token = parts[0].lower()
+
+        # 3. Маршрутизация по типам
+        if first_token == 'match':
+            # Передаем parts, чтобы MatchLine не парсил снова
+            return MatchLine(raw_line, parts=parts)
+
+        if first_token == 'include':
+            return IgnoredLine(raw_line)
+
+        # 4. Всё остальное считаем опцией конфигурации
+        return ConfigLine(raw_line, parts=parts)
+
+class IgnoredLine(SshLine):
+    """Строки, которые мы не трогаем (комменты, пустые, include, ошибки)."""
+    pass
+
+class MatchLine(SshLine):
+    """Директива Match. Определяет Scope."""
+
+    def __init__(self, raw_content, parts=None):
+        super().__init__(raw_content)
+
+        # ОПТИМИЗАЦИЯ:
+        # Если parts передали (из Фабрики) — используем их.
+        # Если не передали (создаем объект вручную в тесте) — парсим сами.
+        if parts is None:
+            try:
+                parts = shlex.split(raw_content.strip())
+            except ValueError:
+                parts = []
+
+        # Теперь parts гарантированно есть, вычисляем scope
+        if parts and len(parts) > 1:
+            val = " ".join(parts[1:])
+            self.scope = "global" if val.lower() == "all" else val
+        else:
+            # Fallback на случай кривой строки
+            self.scope = "global"
+
+class ConfigLine(SshLine):
+    """Опция конфигурации (Key Value)."""
+    def __init__(self, raw_content, parts=None):
+        super().__init__(raw_content)
+
+        # 1. Вычисляем отступ (это быстро, shlex не нужен)
+        self.indent = raw_content[:len(raw_content) - len(raw_content.lstrip())]
+
+        # 2. Получаем токены
+        if parts is None:
+            stripped = raw_content.strip()
+            try:
+                parts = shlex.split(stripped)
+            except ValueError:
+                parts = []
+
+        # 3. Заполняем поля
+        if parts:
+            self.key = parts[0]
+            self.key_lower = self.key.lower()
+            self.value = " ".join(parts[1:])
+        else:
+            # На случай создания пустой ConfigLine (вряд ли случится, но для надежности)
+            self.key = ""
+            self.key_lower = ""
+            self.value = ""
+
+    def update(self, new_value):
+        if self.value == new_value:
+            return False
+
+        old_val = self.value
+        self.value = new_value
+        self.modified = True
+        # Регенерируем строку
+        self.raw = f"{self.indent}{self.key} {self.value}\n"
+        self._diff_info = {'action': 'update', 'val': new_value, 'old_val': old_val}
+        return True
+
+    def comment_out(self):
+        self.raw = f"# {self.render().rstrip()} # Removed by Ansible\n"
+        self.modified = True
+        self._diff_info = {'action': 'remove', 'content': self.key}
+
 class FileManipulator:
     """
     File manipulation handler. Responsible exclusively for stream-based file editing.
@@ -88,85 +209,52 @@ class FileManipulator:
         self.module = module
         self.diffs = []
 
-    def update_file(self, filepath, target_scope, key, value=None, mode="ensure_present"):
-        """
-        Scans the file line by line.
-        mode='ensure_present': Updates the key value in the target scope.
-        mode='ensure_absent': Comments out the key in the target scope.
-        Returns True if the key was found in this file.
-        """
+    def process_file(self, filepath, target_scope, target_key, target_value=None, state="present"):
         if not os.path.exists(filepath):
             return False
 
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+                raw_lines = f.readlines()
         except IOError:
             return False
 
-        new_lines = []
-        modified = False
+        # === ВОТ ЗДЕСЬ СТАЛО ЧИСТО ===
+        # Используем фабричный метод класса
+        line_objects = [SshLine.create(line) for line in raw_lines]
+
         current_scope = "global"
-        target_key_lower = key.lower()
+        target_key_lower = target_key.lower()
         found_in_scope = False
+        file_modified = False
 
-        for i, line in enumerate(lines):
-            stripped = line.strip()
+        for i, obj in enumerate(line_objects):
 
-            # Preserve file structure (comments, blank lines)
-            if not stripped or stripped.startswith('#'):
-                new_lines.append(line)
+            # Полиморфизм: проверяем тип объекта
+            if isinstance(obj, MatchLine):
+                current_scope = obj.scope
                 continue
 
-            try:
-                parts = shlex.split(stripped)
-            except ValueError:
-                new_lines.append(line)
-                continue
+            if isinstance(obj, ConfigLine):
+                if current_scope == target_scope and obj.key_lower == target_key_lower:
+                    # Бизнес-логика
+                    if state == "absent":
+                        obj.comment_out()
+                    elif state == "present":
+                        found_in_scope = True
+                        obj.update(target_value)
 
-            if not parts:
-                new_lines.append(line)
-                continue
+                    if obj.modified:
+                        file_modified = True
+                        if obj.diff:
+                            # Добавляем контекст (файл/строка)
+                            diff_entry = obj.diff.copy()
+                            diff_entry.update({'file': filepath, 'line': i + 1})
+                            self.diffs.append(diff_entry)
 
-            row_key = parts[0].lower()
-
-            # --- Context management (Match directives) ---
-            if row_key == "match":
-                val = " ".join(parts[1:])
-                current_scope = "global" if val.lower() == "all" else val
-                new_lines.append(line)
-                continue
-
-            if row_key == "include":
-                new_lines.append(line)
-                continue
-
-            # --- Option processing ---
-            if current_scope == target_scope and row_key == target_key_lower:
-                if mode == "ensure_absent":
-                    # Remove by commenting out
-                    new_lines.append(f"# {line.rstrip()} # Removed by Ansible\n")
-                    modified = True
-                    self.diffs.append({'file': filepath, 'action': 'remove', 'line': i+1, 'content': stripped})
-
-                elif mode == "ensure_present":
-                    found_in_scope = True
-                    current_val = " ".join(parts[1:])
-
-                    if current_val != value:
-                        # Update while preserving original indentation
-                        indent = line[:len(line) - len(line.lstrip())]
-                        new_lines.append(f"{indent}{key} {value}\n")
-                        modified = True
-                        self.diffs.append({'file': filepath, 'action': 'update', 'line': i+1, 'val': value})
-                    else:
-                        # Value is already correct
-                        new_lines.append(line)
-            else:
-                new_lines.append(line)
-
-        if modified:
-            self._write_atomic(filepath, new_lines)
+        if file_modified:
+            new_content = [obj.render() for obj in line_objects]
+            self._write_atomic(filepath, new_content)
 
         return found_in_scope
 
@@ -205,20 +293,20 @@ class FileManipulator:
                 stripped = line.strip().lower()
                 # Simplified header check
                 if stripped.startswith('match '):
-                     # Parse precisely to verify condition
-                     try:
-                         parts = shlex.split(line.strip())
-                         block_scope = " ".join(parts[1:])
-                     except ValueError:
-                         continue
+                    # Parse precisely to verify condition
+                    try:
+                        parts = shlex.split(line.strip())
+                        block_scope = " ".join(parts[1:])
+                    except ValueError:
+                        continue
 
-                     if block_scope == condition:
-                         # Block found! Insert immediately after header with indentation
-                         lines.insert(i + 1, f"    {new_line}")
-                         match_found = True
-                         inserted = True
-                         self.diffs.append({'file': filepath, 'action': 'insert_match', 'val': value})
-                         break
+                    if block_scope == condition:
+                        # Block found! Insert immediately after header with indentation
+                        lines.insert(i + 1, f"    {new_line}")
+                        match_found = True
+                        inserted = True
+                        self.diffs.append({'file': filepath, 'action': 'insert_match', 'val': value})
+                        break
 
             if not match_found:
                 # Block does not exist -> create new block at end of file
@@ -264,7 +352,7 @@ def main():
     )
 
     if SshConfigParser is None:
-        module.fail_json(msg="Could not import SshConfigParser from aursu.general. Is the collection installed?")
+        module.fail_json(msg="Could not import SshConfigParser. Is aursu.general collection installed?")
 
     config_path = module.params["config_path"]
     key = module.params["key"]
@@ -276,7 +364,6 @@ def main():
     if state == "present" and value is None:
         module.fail_json(msg="parameter \"value\" is required when state is \"present\"")
 
-    # --- 1. ANALYSIS (Using Parser) ---
     if not os.path.exists(config_path) and state == "absent":
         # If config does not exist and we want to remove - already satisfied, no action needed
         module.exit_json(changed=False)
@@ -307,25 +394,24 @@ def main():
                 option_location = opts[key].get('location')
                 option_appearance = opts[key].get('appearance', [])
 
-    # --- 2. EXECUTION (Using Manipulator) ---
     manipulator = FileManipulator(module)
 
     if state == "absent":
         if option_appearance:
             # Remove from all locations where found
             for fpath in option_appearance:
-                manipulator.update_file(fpath, condition, key, mode="ensure_absent")
+                manipulator.process_file(fpath, condition, key, state="absent")
 
     elif state == "present":
         if option_location:
             # Scenario A: Option ALREADY exists.
             # 1. Update the "winner" (effective location)
-            manipulator.update_file(option_location, condition, key, value, mode="ensure_present")
+            manipulator.process_file(option_location, condition, key, target_value=value, state="present")
 
             # 2. Remove the "losers" (shadowed duplicates)
             for fpath in option_appearance:
                 if fpath != option_location:
-                    manipulator.update_file(fpath, condition, key, mode="ensure_absent")
+                    manipulator.process_file(fpath, condition, key, state="absent")
         else:
             # Scenario B: Option does NOT exist.
             # Insert into the main file (or user-specified file)
