@@ -81,7 +81,7 @@ diff:
 
 class SshLine:
     """
-    Базовый класс и Фабрика.
+    Base class and factory for SSH configuration lines.
     """
     def __init__(self, raw_content):
         self.raw = raw_content
@@ -98,19 +98,20 @@ class SshLine:
     @classmethod
     def create(cls, raw_line):
         """
-        Фабричный метод. Анализирует строку и возвращает экземпляр правильного подкласса.
+        Factory method. Analyzes the line and returns an instance of the appropriate subclass.
         """
         stripped = raw_line.strip()
 
-        # 1. Быстрая проверка на мусор (комментарии, пустые строки)
+        # 1. Quick check for non-parseable content (comments, blank lines)
         if not stripped or stripped.startswith('#'):
             return IgnoredLine(raw_line)
 
-        # 2. Пробуем распарсить структуру (чтобы определить тип)
+        # 2. Attempt to parse structure to determine line type
         try:
             parts = shlex.split(stripped)
         except ValueError:
-            # Если кавычки не закрыты или мусор — считаем Ignored, не ломаем скрипт
+            # If quotes are unclosed or input is malformed
+            # treat as Ignored, do not break execution
             return IgnoredLine(raw_line)
 
         if not parts:
@@ -118,53 +119,52 @@ class SshLine:
 
         first_token = parts[0].lower()
 
-        # 3. Маршрутизация по типам
+        # 3. Route by line type
         if first_token == 'match':
-            # Передаем parts, чтобы MatchLine не парсил снова
+            # Pass parts so MatchLine does not parse again
             return MatchLine(raw_line, parts=parts)
 
         if first_token == 'include':
             return IgnoredLine(raw_line)
 
-        # 4. Всё остальное считаем опцией конфигурации
+        # 4. All other cases are treated as configuration options
         return ConfigLine(raw_line, parts=parts)
 
 class IgnoredLine(SshLine):
-    """Строки, которые мы не трогаем (комменты, пустые, include, ошибки)."""
+    """Lines that are not modified (comments, blank lines, includes, parse errors)."""
     pass
 
 class MatchLine(SshLine):
-    """Директива Match. Определяет Scope."""
+    """Match directive. Defines a scope context."""
 
     def __init__(self, raw_content, parts=None):
         super().__init__(raw_content)
 
-        # ОПТИМИЗАЦИЯ:
-        # Если parts передали (из Фабрики) — используем их.
-        # Если не передали (создаем объект вручную в тесте) — парсим сами.
+        # If parts are provided (from Factory) — use them.
+        # If not provided (manual object creation in tests) — parse ourselves.
         if parts is None:
             try:
                 parts = shlex.split(raw_content.strip())
             except ValueError:
                 parts = []
 
-        # Теперь parts гарантированно есть, вычисляем scope
+        # Now parts are guaranteed to exist, compute scope
         if parts and len(parts) > 1:
             val = " ".join(parts[1:])
             self.scope = "global" if val.lower() == "all" else val
         else:
-            # Fallback на случай кривой строки
+            # Fallback for malformed lines
             self.scope = "global"
 
 class ConfigLine(SshLine):
-    """Опция конфигурации (Key Value)."""
+    """Configuration option (Key Value pair)."""
     def __init__(self, raw_content, parts=None):
         super().__init__(raw_content)
 
-        # 1. Вычисляем отступ (это быстро, shlex не нужен)
+        # 1. Compute indentation (fast operation, no shlex needed)
         self.indent = raw_content[:len(raw_content) - len(raw_content.lstrip())]
 
-        # 2. Получаем токены
+        # 2. Extract tokens
         if parts is None:
             stripped = raw_content.strip()
             try:
@@ -172,13 +172,13 @@ class ConfigLine(SshLine):
             except ValueError:
                 parts = []
 
-        # 3. Заполняем поля
+        # 3. Populate fields
         if parts:
             self.key = parts[0]
             self.key_lower = self.key.lower()
             self.value = " ".join(parts[1:])
         else:
-            # На случай создания пустой ConfigLine (вряд ли случится, но для надежности)
+            # Fallback for empty ConfigLine creation (unlikely, but for safety)
             self.key = ""
             self.key_lower = ""
             self.value = ""
@@ -190,7 +190,7 @@ class ConfigLine(SshLine):
         old_val = self.value
         self.value = new_value
         self.modified = True
-        # Регенерируем строку
+        # Regenerate the line
         self.raw = f"{self.indent}{self.key} {self.value}\n"
         self._diff_info = {'action': 'update', 'val': new_value, 'old_val': old_val}
         return True
@@ -219,8 +219,7 @@ class FileManipulator:
         except IOError:
             return False
 
-        # === ВОТ ЗДЕСЬ СТАЛО ЧИСТО ===
-        # Используем фабричный метод класса
+        # Use the factory method from the class
         line_objects = [SshLine.create(line) for line in raw_lines]
 
         current_scope = "global"
@@ -230,14 +229,14 @@ class FileManipulator:
 
         for i, obj in enumerate(line_objects):
 
-            # Полиморфизм: проверяем тип объекта
+            # Polymorphism: check object type
             if isinstance(obj, MatchLine):
                 current_scope = obj.scope
                 continue
 
             if isinstance(obj, ConfigLine):
                 if current_scope == target_scope and obj.key_lower == target_key_lower:
-                    # Бизнес-логика
+                    # Business logic
                     if state == "absent":
                         obj.comment_out()
                     elif state == "present":
@@ -247,7 +246,7 @@ class FileManipulator:
                     if obj.modified:
                         file_modified = True
                         if obj.diff:
-                            # Добавляем контекст (файл/строка)
+                            # Add context (file/line number)
                             diff_entry = obj.diff.copy()
                             diff_entry.update({'file': filepath, 'line': i + 1})
                             self.diffs.append(diff_entry)
@@ -334,7 +333,6 @@ class FileManipulator:
         except (IOError, OSError) as e:
             os.remove(tmp_path)
             self.module.fail_json(msg=f"Failed to write config: {e}")
-
 
 def main():
     module = AnsibleModule(
