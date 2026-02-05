@@ -275,7 +275,6 @@ class FileManipulator:
                 self.module.fail_json(msg=f"Cannot read file for insertion: {filepath}")
 
         new_line = f"{key} {value}\n"
-        inserted = False
 
         if condition == "global":
             # Determine insertion point (before first Match to avoid inserting inside a block)
@@ -304,7 +303,6 @@ class FileManipulator:
                         # Block found! Insert immediately after header with indentation
                         lines.insert(i + 1, f"    {new_line}")
                         match_found = True
-                        inserted = True
                         self.diffs.append({'file': filepath, 'action': 'insert_match', 'val': value})
                         break
 
