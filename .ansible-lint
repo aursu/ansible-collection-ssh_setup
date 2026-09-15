@@ -1,0 +1,24 @@
+---
+# The lint job is BLOCKING. This file is what makes that survivable: the rules
+# below are reported and do not fail the build, everything else does.
+#
+# The rules that matter - load-failure and syntax-check - are tagged
+# `unskippable`, so ansible-lint refuses to warn-list them no matter what appears
+# below. That is what makes blocking safe rather than merely strict: widening this
+# list later cannot silence a file that will not parse.
+#
+# The intent is a ratchet: shorten the list, do not lengthen it.
+warn_list:
+  - fqcn
+  - name
+  - var-naming
+  - key-order
+  - no-free-form
+  - yaml[line-length]
+  - yaml[comments]
+
+exclude_paths:
+  - .ansible/
+  # Not Ansible content: the local build/publish harness. ansible-lint scans
+  # every YAML file it finds, and its indentation opinions do not apply here.
+  - docker-compose.yml

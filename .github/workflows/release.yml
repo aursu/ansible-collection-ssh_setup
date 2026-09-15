@@ -1,0 +1,91 @@
+---
+name: release
+
+# Publishing is driven by the tag, so the tag is the release. Nothing publishes
+# from a branch.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    name: build and publish to Ansible Galaxy
+    runs-on: ubuntu-latest
+
+    # Needed to create the GitHub release and upload the tarball.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ansible-core
+        run: pip install --disable-pip-version-check ansible-core
+
+      # Galaxy takes the version from galaxy.yml and ignores the tag, and it
+      # refuses a version it already holds. Both failures are permanent: the tag
+      # cannot be re-pointed at a corrected artifact, only abandoned. The script
+      # is runnable by hand before tagging, which is the point of it being a
+      # script rather than inline shell.
+      - name: Pre-flight (tag matches galaxy.yml, version is free on Galaxy)
+        run: python .github/scripts/release_preflight.py
+
+      # The module's DOCUMENTATION block is its contract, and a YAML error in it is
+      # invisible until someone runs ansible-doc - which parses it the same way the
+      # Galaxy importer does, and fails on a malformed one.
+      - name: ansible-doc renders every module
+        env:
+          ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
+        run: |
+          set -e
+          mkdir -p "${RUNNER_TEMP}/collections/ansible_collections/aursu"
+          ln -s "${GITHUB_WORKSPACE}" "${RUNNER_TEMP}/collections/ansible_collections/aursu/ssh_setup"
+          for m in config; do
+            echo "--- aursu.ssh_setup.${m} ---"
+            ansible-doc "aursu.ssh_setup.${m}" >/dev/null
+            echo "    OK"
+          done
+
+      - name: Build
+        run: ansible-galaxy collection build --output-path dist/
+
+      - name: Publish
+        env:
+          GALAXY_API_KEY: ${{ secrets.GALAXY_API_KEY }}
+        run: |
+          if [ -z "${GALAXY_API_KEY}" ]; then
+            echo "::error::GALAXY_API_KEY is not set on this repository."
+            exit 1
+          fi
+          # --api-key must be passed explicitly; ~/.ansible/galaxy_token alone
+          # yields HTTP 401 "Authentication credentials were not provided".
+          ansible-galaxy collection publish dist/*.tar.gz --api-key "${GALAXY_API_KEY}"
+
+      - name: Attach the tarball to the GitHub release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const dir = 'dist';
+            const file = fs.readdirSync(dir).find(f => f.endsWith('.tar.gz'));
+            if (!file) { core.setFailed('no tarball built'); return; }
+            const tag = context.ref.replace('refs/tags/', '');
+            const { data: release } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: tag,
+              body: 'Published to Ansible Galaxy. See CHANGELOG.md.',
+            });
+            await github.rest.repos.uploadReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.id,
+              name: file,
+              data: fs.readFileSync(path.join(dir, file)),
+            });

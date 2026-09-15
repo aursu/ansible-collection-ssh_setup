@@ -61,12 +61,12 @@ author:
 
 EXAMPLES = r"""
 - name: Set SSH Port globally
-  aursu.sshd_setup.config:
+  aursu.ssh_setup.config:
     key: Port
     value: "2222"
 
 - name: Disable PasswordAuthentication for User bob
-  aursu.sshd_setup.config:
+  aursu.ssh_setup.config:
     key: PasswordAuthentication
     value: "no"
     condition: "User bob"

@@ -17,8 +17,7 @@ readme: README.md
 # A list of the collection's content authors. Can be just the name or in the format 'Full Name <email> (url)
 # @nicks:irc/im.site#channel'
 authors:
-- Alexander Ursu <alexander.ursu@gmail.com>
-
+  - Alexander Ursu <alexander.ursu@gmail.com>
 
 ### OPTIONAL but strongly recommended
 # A short summary description of the collection
@@ -30,11 +29,10 @@ description: >-
 # Either a single license or a list of licenses for content inside of a collection. Ansible Galaxy currently only
 # accepts L(SPDX,https://spdx.org/licenses/) licenses. This key is mutually exclusive with 'license_file'
 license:
-- MIT
+  - MIT
 
 # The path to the license file for the collection. This path is relative to the root of the collection. This key is
 # mutually exclusive with 'license'
-license_file: ''
 
 # A list of tags you want to associate with the collection for indexing/searching. A tag name has the same character
 # requirements as 'namespace' and 'name'
@@ -74,10 +72,15 @@ build_ignore:
   - '*.tar.gz'
   - '.git/'
   - '.gitignore'
+  # The file is docker-compose.yml. This said docker-compose.yaml, so it never
+  # matched and the compose file shipped in every artifact.
+  - 'docker-compose.yml'
   - '.env'
-  - 'docker-compose.yaml'
   - 'Dockerfile'
   - 'libexec/'
+  - '.github/'
+  - '.pytest_cache'
+  - 'dist'
   - 'tests/unit/'
 
 # A dict controlling use of manifest directives used in building the collection artifact. The key 'directives' is a
@@ -86,4 +89,3 @@ build_ignore:
 # 'omit_default_directives' is a boolean that controls whether the default directives are used. Mutually exclusive
 # with 'build_ignore'
 # manifest: null
-

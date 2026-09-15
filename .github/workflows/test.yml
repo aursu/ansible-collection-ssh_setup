@@ -1,0 +1,86 @@
+---
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  docs:
+    name: module documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      # The collection must sit at ansible_collections/<ns>/<name> inside the
+      # workspace: config.py imports its own module_utils by the full
+      # ansible_collections.aursu.ssh_setup path, so a plain checkout into the
+      # workspace root makes that import fail.
+      - uses: actions/checkout@v4
+        with:
+          path: ansible_collections/aursu/ssh_setup
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ansible-core
+        run: pip install --disable-pip-version-check ansible-core
+
+      # config.py reads aursu.general's ssh_parser, so the dependency has to be
+      # present or the module cannot even be imported. Tracking main rather than
+      # the pinned tag keeps this job from being blocked on a release being cut.
+      - name: Install the dependency
+        run: >-
+          ansible-galaxy collection install
+          git+https://github.com/aursu/ansible-collection-general.git,main
+
+      # The DOCUMENTATION block is the module's contract, and a YAML error in it
+      # is invisible until something parses it. ansible-doc parses it the same way
+      # the Galaxy importer does.
+      - name: ansible-doc renders every module
+        env:
+          ANSIBLE_COLLECTIONS_PATH: ${{ github.workspace }}
+        run: |
+          set -e
+          for m in config; do
+            echo "--- aursu.ssh_setup.${m} ---"
+            ansible-doc "aursu.ssh_setup.${m}" >/dev/null
+            echo "    OK"
+          done
+
+      # A module that will not import is a module that fails at run time on every
+      # host it is pushed to. Cheap to check here.
+      - name: Every plugin compiles
+        working-directory: ansible_collections/aursu/ssh_setup
+        run: python -m compileall -q plugins/
+
+  lint:
+    name: ansible-lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ansible_collections/aursu/ssh_setup
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ansible-lint
+        run: pip install --disable-pip-version-check ansible-lint
+
+      - name: Install the dependency so module references resolve
+        run: >-
+          ansible-galaxy collection install
+          git+https://github.com/aursu/ansible-collection-general.git,main
+
+      # Blocking. .ansible-lint warn-lists the pre-existing stylistic rules;
+      # everything else fails the build. load-failure and syntax-check are tagged
+      # unskippable, so a file that cannot be parsed cannot be warn-listed away -
+      # which is what makes this safe to block on.
+      - name: Lint the collection
+        working-directory: ansible_collections/aursu/ssh_setup
+        run: ansible-lint

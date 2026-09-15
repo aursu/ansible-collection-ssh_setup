@@ -1,0 +1,13 @@
+# Build artifacts
+*.tar.gz
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local credentials: the Galaxy token is mounted as a compose secret, never
+# committed. See docker-compose.yml and libexec/publish.
+.env
+secrets/
