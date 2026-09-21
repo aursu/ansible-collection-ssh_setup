@@ -8,6 +8,31 @@ on:
     branches: [main]
 
 jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      # The collection must sit at ansible_collections/<ns>/<name>: the tests
+      # import the module by its full ansible_collections.aursu.ssh_setup path,
+      # which is also how Ansible loads it.
+      - uses: actions/checkout@v4
+        with:
+          path: ansible_collections/aursu/ssh_setup
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the test toolchain
+        run: pip install --disable-pip-version-check ansible-core pytest
+
+      - name: Unit tests
+        working-directory: ansible_collections/aursu/ssh_setup
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest tests/unit -q
+
   docs:
     name: module documentation
     runs-on: ubuntu-latest
