@@ -31,8 +31,9 @@ class FakeModule:
     temp file and then moves it, and a stub would let a broken write pass.
     """
 
-    def __init__(self, backup=False):
+    def __init__(self, backup=False, check_mode=False):
         self.params = {"backup": backup}
+        self.check_mode = check_mode
         self.backups = []
         self.failures = []
 
@@ -314,3 +315,64 @@ class TestInsertNewOption:
         FileManipulator(FakeModule()).insert_new_option(path, "global", "Port", "2222")
         assert os.path.exists(path)
         assert read(path) == "Port 2222\n"
+
+
+class TestCheckMode:
+    """A check run must report exactly what a real run would do, and write nothing.
+
+    The value is not the reporting - it is that these hosts often cannot be
+    recovered if a write goes wrong, so the preview has to be trustworthy in both
+    directions: it must not write, and it must not stay silent about a change.
+    """
+
+    def test_update_is_reported_but_not_written(self, tmp_path):
+        module = FakeModule(check_mode=True)
+        path = write(tmp_path / "sshd_config", "PasswordAuthentication yes\n")
+        manipulator = FileManipulator(module)
+        manipulator.process_file(path, "global", "PasswordAuthentication",
+                                 target_value="no", state="present")
+        assert read(path) == "PasswordAuthentication yes\n", "the file must be untouched"
+        assert len(manipulator.diffs) == 1, "but the change must still be reported"
+        assert manipulator.diffs[0]["action"] == "update"
+        assert manipulator.diffs[0]["val"] == "no"
+
+    def test_removal_is_reported_but_not_written(self, tmp_path):
+        module = FakeModule(check_mode=True)
+        path = write(tmp_path / "sshd_config", "PermitRootLogin yes\n")
+        manipulator = FileManipulator(module)
+        manipulator.process_file(path, "global", "PermitRootLogin", state="absent")
+        assert read(path) == "PermitRootLogin yes\n"
+        assert manipulator.diffs[0]["action"] == "remove"
+
+    def test_insertion_is_reported_but_not_written(self, tmp_path):
+        module = FakeModule(check_mode=True)
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        manipulator = FileManipulator(module)
+        manipulator.insert_new_option(path, "global", "PermitRootLogin", "no")
+        assert read(path) == "Port 22\n"
+        assert manipulator.diffs[0]["action"] == "insert_global"
+
+    def test_check_mode_creates_no_file_and_no_directory(self, tmp_path):
+        """The insertion path creates a directory for a new drop-in. Under check
+        mode it must create neither - a preview that leaves an empty conf.d/
+        behind has already changed the host."""
+        module = FakeModule(check_mode=True)
+        target = tmp_path / "conf.d" / "90-ansible.conf"
+        FileManipulator(module).insert_new_option(str(target), "global", "Port", "2222")
+        assert not target.exists()
+        assert not target.parent.exists(), "not even the directory"
+
+    def test_check_mode_takes_no_backup(self, tmp_path):
+        module = FakeModule(backup=True, check_mode=True)
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        FileManipulator(module).process_file(path, "global", "Port",
+                                             target_value="2222", state="present")
+        assert module.backups == []
+
+    def test_no_change_reports_nothing_in_check_mode(self, tmp_path):
+        """Idempotence must survive check mode: already-correct reports no change."""
+        module = FakeModule(check_mode=True)
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        manipulator = FileManipulator(module)
+        manipulator.process_file(path, "global", "Port", target_value="22", state="present")
+        assert manipulator.diffs == []

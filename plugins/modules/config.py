@@ -55,6 +55,10 @@ options:
     description: Create a backup file.
     type: bool
     default: false
+notes:
+  - Supports check mode. A check run reports the change it would make and writes
+    nothing - not the file, not a backup, and not the directory a new drop-in
+    would need.
 author:
   - Alexander Ursu (@aursu)
 """
@@ -208,6 +212,11 @@ class FileManipulator:
     def __init__(self, module):
         self.module = module
         self.diffs = []
+        # Check mode is handled in exactly one place - _write_atomic - because
+        # that is the only method that touches the filesystem. Everything else
+        # reads, decides and records a diff, which is precisely what a check run
+        # should still do.
+        self.check_mode = getattr(module, "check_mode", False)
 
     def process_file(self, filepath, target_scope, target_key, target_value=None, state="present"):
         if not os.path.exists(filepath):
@@ -314,6 +323,13 @@ class FileManipulator:
         self._write_atomic(filepath, lines)
 
     def _write_atomic(self, filepath, lines):
+        # The single gate for check mode. Returning here leaves self.diffs
+        # populated, so the run still reports what it would have done - and it
+        # returns BEFORE backup_local and before makedirs, so a check run creates
+        # nothing at all, not even a directory.
+        if self.check_mode:
+            return
+
         if self.module.params['backup']:
             self.module.backup_local(filepath)
 
@@ -344,7 +360,10 @@ def main():
             state=dict(type="str", choices=["present", "absent"], default="present"),
             backup=dict(type="bool", default=False),
         ),
-        supports_check_mode=False
+        # The hosts where a preview matters most are the ones that cannot be
+        # recovered without one: dev-web-013..017 are Proxmox guests with no
+        # console. Refusing to run under --check was backwards.
+        supports_check_mode=True
     )
 
     if SshConfigParser is None:
