@@ -31,11 +31,21 @@ class FakeModule:
     temp file and then moves it, and a stub would let a broken write pass.
     """
 
-    def __init__(self, backup=False, check_mode=False):
-        self.params = {"backup": backup}
+    def __init__(self, backup=False, check_mode=False, validate=None, rc=0, stderr=""):
+        self.params = {"backup": backup, "validate": validate}
         self.check_mode = check_mode
         self.backups = []
         self.failures = []
+        self.commands = []
+        self._rc = rc
+        self._stderr = stderr
+
+    def get_bin_path(self, name, opt_dirs=None):
+        return "/usr/sbin/" + name
+
+    def run_command(self, command):
+        self.commands.append(command)
+        return self._rc, "", self._stderr
 
     def backup_local(self, path):
         self.backups.append(path)
@@ -376,3 +386,79 @@ class TestCheckMode:
         manipulator = FileManipulator(module)
         manipulator.process_file(path, "global", "Port", target_value="22", state="present")
         assert manipulator.diffs == []
+
+
+class TestValidation:
+    """The candidate file is checked before it replaces the real one.
+
+    The exit-code handling is the substance here. sshd checks syntax before it
+    looks for host keys, so a run that reaches "no hostkeys available" has already
+    accepted the configuration. A validator that treated any non-zero exit as
+    failure would reject every valid file whenever host keys are unreadable, which
+    is the normal case unprivileged.
+    """
+
+    def test_validation_runs_against_the_candidate_not_the_real_file(self, tmp_path):
+        module = FakeModule()
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        FileManipulator(module).process_file(path, "global", "Port",
+                                             target_value="2222", state="present")
+        assert len(module.commands) == 1
+        command = module.commands[0]
+        assert command.startswith("/usr/sbin/sshd -t -f ")
+        assert path not in command, "it must check the temp file, not the live one"
+
+    def test_a_rejected_configuration_leaves_the_file_untouched(self, tmp_path):
+        """rc 255 is sshd saying the config is wrong. The original must survive."""
+        module = FakeModule(rc=255, stderr="line 1: Bad configuration option: Nonsense")
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        with pytest.raises(AssertionError):
+            FileManipulator(module).process_file(path, "global", "Port",
+                                                 target_value="2222", state="present")
+        assert read(path) == "Port 22\n", "the live file must not have been replaced"
+        assert "Bad configuration option" in module.failures[0]["msg"]
+
+    def test_missing_host_keys_is_accepted_not_rejected(self, tmp_path):
+        """rc 1 with 'no hostkeys available' means the syntax passed.
+
+        Measured on OpenSSH 9.6p1: a valid file run unprivileged exits 1 here.
+        Rejecting it would make the module unusable without root.
+        """
+        module = FakeModule(rc=1, stderr="sshd: no hostkeys available -- exiting.")
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        FileManipulator(module).process_file(path, "global", "Port",
+                                             target_value="2222", state="present")
+        assert read(path) == "Port 2222\n", "a valid change must still be applied"
+        assert module.failures == []
+
+    def test_validation_can_be_disabled(self, tmp_path):
+        module = FakeModule(validate="")
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        FileManipulator(module).process_file(path, "global", "Port",
+                                             target_value="2222", state="present")
+        assert module.commands == []
+        assert read(path) == "Port 2222\n"
+
+    def test_a_custom_command_is_used_verbatim(self, tmp_path):
+        module = FakeModule(validate="/opt/sshd -t -f %s")
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        FileManipulator(module).process_file(path, "global", "Port",
+                                             target_value="2222", state="present")
+        assert module.commands[0].startswith("/opt/sshd -t -f ")
+
+    def test_a_command_without_the_placeholder_is_refused(self, tmp_path):
+        """Without %s the check would silently validate the wrong file."""
+        module = FakeModule(validate="/usr/sbin/sshd -t")
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        with pytest.raises(AssertionError):
+            FileManipulator(module).process_file(path, "global", "Port",
+                                                 target_value="2222", state="present")
+        assert "%s" in module.failures[0]["msg"]
+
+    def test_check_mode_does_not_validate(self, tmp_path):
+        """Nothing is written, so there is no candidate to check."""
+        module = FakeModule(check_mode=True)
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        FileManipulator(module).process_file(path, "global", "Port",
+                                             target_value="2222", state="present")
+        assert module.commands == []

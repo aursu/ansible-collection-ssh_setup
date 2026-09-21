@@ -55,10 +55,26 @@ options:
     description: Create a backup file.
     type: bool
     default: false
+  validate:
+    description:
+      - Command used to check the candidate file before it replaces the real one.
+      - Must contain C(%s), which is replaced by the path of the temporary file.
+      - Defaults to C(sshd -t -f %s), located with the module's usual binary search.
+      - Set to an empty string to skip validation entirely. Doing so on a host with
+        no console is how a configuration that prevents sshd starting ends access
+        to that host.
+    type: str
 notes:
   - Supports check mode. A check run reports the change it would make and writes
     nothing - not the file, not a backup, and not the directory a new drop-in
     would need.
+  - This module does NOT reload or restart sshd, deliberately. Writing a file and
+    restarting a daemon are different decisions, and only the caller knows whether
+    several options are being set in one run or whether this is the last of them.
+    Notify a handler instead - the module reports C(changed) precisely so that
+    works. Restarting inside the module would also make the blast radius of a bad
+    edit immediate rather than deferred, on hosts where the daemon in question is
+    the only way back in.
 author:
   - Alexander Ursu (@aursu)
 """
@@ -74,6 +90,31 @@ EXAMPLES = r"""
     key: PasswordAuthentication
     value: "no"
     condition: "User bob"
+
+# The module never reloads sshd itself. Notify a handler, so several option
+# changes in one play cause exactly one reload, at the end.
+- name: Harden the daemon
+  aursu.ssh_setup.config:
+    key: "{{ item.key }}"
+    value: "{{ item.value }}"
+  loop:
+    - {key: PermitRootLogin, value: prohibit-password}
+    - {key: X11Forwarding, value: "no"}
+  notify: reload sshd
+
+# handlers:
+#   - name: reload sshd
+#     ansible.builtin.service:
+#       name: sshd
+#       state: reloaded
+
+# Skip validation only where sshd is genuinely unavailable - a container image
+# being built, say. Never on a host you cannot get a console to.
+- name: Set a port in an image with no sshd installed
+  aursu.ssh_setup.config:
+    key: Port
+    value: "2222"
+    validate: ""
 """
 
 RETURN = r"""
@@ -322,6 +363,50 @@ class FileManipulator:
 
         self._write_atomic(filepath, lines)
 
+    def _validate(self, candidate_path):
+        """Ask sshd whether the candidate file is legal, before it replaces anything.
+
+        Exit codes, measured on OpenSSH 9.6p1 rather than assumed:
+
+            good config, no host keys  ->  1    "sshd: no hostkeys available -- exiting."
+            unknown directive          ->  255  "line 2: Bad configuration option: ..."
+            bad value                  ->  255  "line 1: Badly formatted port number."
+
+        The distinction is the whole point. sshd checks syntax BEFORE it looks for
+        host keys, so a run that gets as far as complaining about host keys has
+        already accepted the configuration. Treating any non-zero exit as failure
+        would reject every valid file whenever host keys are unreadable - which is
+        the normal case when running unprivileged.
+        """
+        command = self.module.params.get('validate')
+
+        if command is None:
+            sshd = self.module.get_bin_path('sshd', opt_dirs=['/usr/sbin', '/sbin'])
+            if not sshd:
+                self.module.fail_json(
+                    msg="sshd not found, so the candidate configuration cannot be "
+                        "validated. Install it, pass an explicit 'validate' command, "
+                        "or set validate='' to skip the check.")
+            command = "%s -t -f %%s" % sshd
+
+        if not command:
+            return  # explicitly disabled by the caller
+
+        if '%s' not in command:
+            self.module.fail_json(msg="validate must contain %s, the candidate file path")
+
+        rc, _stdout, stderr = self.module.run_command(command % candidate_path)
+        if rc == 0:
+            return
+
+        # sshd got past parsing and stopped for want of host keys: the file is fine.
+        if 'no hostkeys available' in (stderr or ''):
+            return
+
+        self.module.fail_json(
+            msg="the configuration sshd would have been given is invalid, so "
+                "%s was left unchanged: %s" % (self.target_path, (stderr or '').strip()))
+
     def _write_atomic(self, filepath, lines):
         # The single gate for check mode. Returning here leaves self.diffs
         # populated, so the run still reports what it would have done - and it
@@ -345,6 +430,11 @@ class FileManipulator:
         try:
             with os.fdopen(tmp_fd, 'w') as f:
                 f.writelines(lines)
+            # Validate the CANDIDATE while the real file is still in place, so a
+            # rejected change is a change that never happened - rather than one
+            # rolled back after sshd has already been handed a broken file.
+            self.target_path = filepath
+            self._validate(tmp_path)
             self.module.atomic_move(tmp_path, filepath)
         except (IOError, OSError) as e:
             os.remove(tmp_path)
@@ -359,6 +449,7 @@ def main():
             condition=dict(type="str", default="global"),
             state=dict(type="str", choices=["present", "absent"], default="present"),
             backup=dict(type="bool", default=False),
+            validate=dict(type="str"),
         ),
         # The hosts where a preview matters most are the ones that cannot be
         # recovered without one: dev-web-013..017 are Proxmox guests with no
