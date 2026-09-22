@@ -4,7 +4,10 @@ All notable changes to `aursu.ssh_setup` are documented here.
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-09-22
+
+First release. The module existed and worked before this, but had never been published, and the
+gaps below were closed while that was still free to do - the option shape is fixed from here.
 
 ### Added
 
