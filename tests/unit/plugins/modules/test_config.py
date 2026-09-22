@@ -17,7 +17,7 @@ import pytest
 
 from ansible_collections.aursu.ssh_setup.plugins.modules.config import (
     ConfigLine,
-    FileManipulator,
+    SshConfigEditor,
     IgnoredLine,
     MatchLine,
     SshLine,
@@ -25,7 +25,7 @@ from ansible_collections.aursu.ssh_setup.plugins.modules.config import (
 
 
 class FakeModule:
-    """The slice of AnsibleModule that FileManipulator actually uses.
+    """The slice of AnsibleModule that SshConfigEditor actually uses.
 
     atomic_move is a real move rather than a stub: the module writes through a
     temp file and then moves it, and a stub would let a broken write pass.
@@ -159,7 +159,7 @@ class TestProcessFile:
             "Match User bob\n"
             "    PasswordAuthentication yes\n"
         ))
-        FileManipulator(FakeModule()).process_file(path, "global", "PasswordAuthentication",
+        SshConfigEditor(FakeModule()).process_file(path, "global", "PasswordAuthentication",
                                                    target_value="no", state="present")
         out = read(path)
         assert out.splitlines()[0] == "PasswordAuthentication no"
@@ -171,7 +171,7 @@ class TestProcessFile:
             "Match User bob\n"
             "    PasswordAuthentication yes\n"
         ))
-        FileManipulator(FakeModule()).process_file(path, "User bob", "PasswordAuthentication",
+        SshConfigEditor(FakeModule()).process_file(path, "User bob", "PasswordAuthentication",
                                                    target_value="no", state="present")
         out = read(path).splitlines()
         assert out[0] == "PasswordAuthentication yes"
@@ -185,7 +185,7 @@ class TestProcessFile:
             "Match All\n"
             "X11Forwarding yes\n"
         ))
-        FileManipulator(FakeModule()).process_file(path, "global", "X11Forwarding",
+        SshConfigEditor(FakeModule()).process_file(path, "global", "X11Forwarding",
                                                    target_value="no", state="present")
         out = read(path).splitlines()
         assert out[1] == "    X11Forwarding yes", "the Match-scoped one must be untouched"
@@ -200,14 +200,14 @@ class TestProcessFile:
             "# trailing note\n"
         )
         path = write(tmp_path / "sshd_config", original)
-        FileManipulator(FakeModule()).process_file(path, "global", "Port",
+        SshConfigEditor(FakeModule()).process_file(path, "global", "Port",
                                                    target_value="2222", state="present")
         out = read(path)
         assert out == original.replace("Port 22\n", "Port 2222\n")
 
     def test_absent_comments_the_line_out(self, tmp_path):
         path = write(tmp_path / "sshd_config", "Port 22\nPermitRootLogin yes\n")
-        FileManipulator(FakeModule()).process_file(path, "global", "PermitRootLogin",
+        SshConfigEditor(FakeModule()).process_file(path, "global", "PermitRootLogin",
                                                    state="absent")
         out = read(path)
         assert "# PermitRootLogin yes # Removed by Ansible" in out
@@ -215,7 +215,7 @@ class TestProcessFile:
 
     def test_absent_across_three_files_comments_all_three(self, tmp_path):
         """The shadowed-duplicate case: every occurrence must go, not just the winner."""
-        manipulator = FileManipulator(FakeModule())
+        manipulator = SshConfigEditor(FakeModule())
         paths = []
         for name in ("a.conf", "b.conf", "c.conf"):
             paths.append(write(tmp_path / name, "PasswordAuthentication yes\n"))
@@ -232,7 +232,7 @@ class TestProcessFile:
         directive commented out. Leaving a duplicate active is the failure that
         makes an edit silently ineffective.
         """
-        manipulator = FileManipulator(FakeModule())
+        manipulator = SshConfigEditor(FakeModule())
         winner = write(tmp_path / "50-cloud-init.conf", "PasswordAuthentication yes\n")
         loser = write(tmp_path / "sshd_config", "PasswordAuthentication yes\n")
 
@@ -244,13 +244,13 @@ class TestProcessFile:
         assert read(loser) == "# PasswordAuthentication yes # Removed by Ansible\n"
 
     def test_missing_file_is_not_an_error(self, tmp_path):
-        assert FileManipulator(FakeModule()).process_file(
+        assert SshConfigEditor(FakeModule()).process_file(
             str(tmp_path / "nope.conf"), "global", "Port", target_value="22") is False
 
     def test_a_malformed_line_does_not_stop_the_edit(self, tmp_path):
         """An unparseable line earlier in the file must not prevent a later edit."""
         path = write(tmp_path / "sshd_config", 'Banner "/etc/unclosed\nPort 22\n')
-        FileManipulator(FakeModule()).process_file(path, "global", "Port",
+        SshConfigEditor(FakeModule()).process_file(path, "global", "Port",
                                                    target_value="2222", state="present")
         out = read(path)
         assert 'Banner "/etc/unclosed\n' in out, "the malformed line must be left verbatim"
@@ -259,7 +259,7 @@ class TestProcessFile:
     def test_backup_is_taken_only_when_requested(self, tmp_path):
         module = FakeModule(backup=True)
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(module).process_file(path, "global", "Port",
+        SshConfigEditor(module).process_file(path, "global", "Port",
                                              target_value="2222", state="present")
         assert module.backups == [path]
 
@@ -267,7 +267,7 @@ class TestProcessFile:
         """If the value already matches, the file must not be rewritten at all."""
         module = FakeModule(backup=True)
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(module).process_file(path, "global", "Port",
+        SshConfigEditor(module).process_file(path, "global", "Port",
                                              target_value="22", state="present")
         assert module.backups == [], "a no-op must not even take a backup"
 
@@ -282,14 +282,14 @@ class TestInsertNewOption:
             "Match User bob\n"
             "    PasswordAuthentication yes\n"
         ))
-        FileManipulator(FakeModule()).insert_new_option(path, "global", "PermitRootLogin", "no")
+        SshConfigEditor(FakeModule()).insert_new_option(path, "global", "PermitRootLogin", "no")
         out = read(path).splitlines()
         assert out[0] == "PermitRootLogin no"
         assert out[1] == "Match User bob"
 
     def test_global_option_appended_when_there_is_no_match_block(self, tmp_path):
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(FakeModule()).insert_new_option(path, "global", "PermitRootLogin", "no")
+        SshConfigEditor(FakeModule()).insert_new_option(path, "global", "PermitRootLogin", "no")
         assert read(path) == "Port 22\nPermitRootLogin no\n"
 
     def test_inserted_into_an_existing_match_block(self, tmp_path):
@@ -298,7 +298,7 @@ class TestInsertNewOption:
             "Match User bob\n"
             "    X11Forwarding no\n"
         ))
-        FileManipulator(FakeModule()).insert_new_option(
+        SshConfigEditor(FakeModule()).insert_new_option(
             path, "User bob", "PasswordAuthentication", "no")
         out = read(path).splitlines()
         assert out[1] == "Match User bob"
@@ -307,7 +307,7 @@ class TestInsertNewOption:
 
     def test_a_missing_match_block_is_created(self, tmp_path):
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(FakeModule()).insert_new_option(
+        SshConfigEditor(FakeModule()).insert_new_option(
             path, "User carol", "PasswordAuthentication", "no")
         out = read(path)
         assert "Match User carol\n    PasswordAuthentication no" in out
@@ -315,14 +315,14 @@ class TestInsertNewOption:
     def test_new_block_is_separated_from_preceding_content(self, tmp_path):
         """Without a blank line the new header can end up glued to the last option."""
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(FakeModule()).insert_new_option(
+        SshConfigEditor(FakeModule()).insert_new_option(
             path, "User carol", "X11Forwarding", "no")
         assert "\nMatch User carol" in read(path)
 
     def test_creates_the_file_when_it_does_not_exist(self, tmp_path):
         """Used for a new drop-in under sshd_config.d/."""
         path = str(tmp_path / "conf.d" / "90-ansible.conf")
-        FileManipulator(FakeModule()).insert_new_option(path, "global", "Port", "2222")
+        SshConfigEditor(FakeModule()).insert_new_option(path, "global", "Port", "2222")
         assert os.path.exists(path)
         assert read(path) == "Port 2222\n"
 
@@ -338,7 +338,7 @@ class TestCheckMode:
     def test_update_is_reported_but_not_written(self, tmp_path):
         module = FakeModule(check_mode=True)
         path = write(tmp_path / "sshd_config", "PasswordAuthentication yes\n")
-        manipulator = FileManipulator(module)
+        manipulator = SshConfigEditor(module)
         manipulator.process_file(path, "global", "PasswordAuthentication",
                                  target_value="no", state="present")
         assert read(path) == "PasswordAuthentication yes\n", "the file must be untouched"
@@ -349,7 +349,7 @@ class TestCheckMode:
     def test_removal_is_reported_but_not_written(self, tmp_path):
         module = FakeModule(check_mode=True)
         path = write(tmp_path / "sshd_config", "PermitRootLogin yes\n")
-        manipulator = FileManipulator(module)
+        manipulator = SshConfigEditor(module)
         manipulator.process_file(path, "global", "PermitRootLogin", state="absent")
         assert read(path) == "PermitRootLogin yes\n"
         assert manipulator.diffs[0]["action"] == "remove"
@@ -357,7 +357,7 @@ class TestCheckMode:
     def test_insertion_is_reported_but_not_written(self, tmp_path):
         module = FakeModule(check_mode=True)
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        manipulator = FileManipulator(module)
+        manipulator = SshConfigEditor(module)
         manipulator.insert_new_option(path, "global", "PermitRootLogin", "no")
         assert read(path) == "Port 22\n"
         assert manipulator.diffs[0]["action"] == "insert_global"
@@ -368,14 +368,14 @@ class TestCheckMode:
         behind has already changed the host."""
         module = FakeModule(check_mode=True)
         target = tmp_path / "conf.d" / "90-ansible.conf"
-        FileManipulator(module).insert_new_option(str(target), "global", "Port", "2222")
+        SshConfigEditor(module).insert_new_option(str(target), "global", "Port", "2222")
         assert not target.exists()
         assert not target.parent.exists(), "not even the directory"
 
     def test_check_mode_takes_no_backup(self, tmp_path):
         module = FakeModule(backup=True, check_mode=True)
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(module).process_file(path, "global", "Port",
+        SshConfigEditor(module).process_file(path, "global", "Port",
                                              target_value="2222", state="present")
         assert module.backups == []
 
@@ -383,7 +383,7 @@ class TestCheckMode:
         """Idempotence must survive check mode: already-correct reports no change."""
         module = FakeModule(check_mode=True)
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        manipulator = FileManipulator(module)
+        manipulator = SshConfigEditor(module)
         manipulator.process_file(path, "global", "Port", target_value="22", state="present")
         assert manipulator.diffs == []
 
@@ -401,7 +401,7 @@ class TestValidation:
     def test_validation_runs_against_the_candidate_not_the_real_file(self, tmp_path):
         module = FakeModule()
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(module).process_file(path, "global", "Port",
+        SshConfigEditor(module).process_file(path, "global", "Port",
                                              target_value="2222", state="present")
         assert len(module.commands) == 1
         command = module.commands[0]
@@ -413,7 +413,7 @@ class TestValidation:
         module = FakeModule(rc=255, stderr="line 1: Bad configuration option: Nonsense")
         path = write(tmp_path / "sshd_config", "Port 22\n")
         with pytest.raises(AssertionError):
-            FileManipulator(module).process_file(path, "global", "Port",
+            SshConfigEditor(module).process_file(path, "global", "Port",
                                                  target_value="2222", state="present")
         assert read(path) == "Port 22\n", "the live file must not have been replaced"
         assert "Bad configuration option" in module.failures[0]["msg"]
@@ -426,7 +426,7 @@ class TestValidation:
         """
         module = FakeModule(rc=1, stderr="sshd: no hostkeys available -- exiting.")
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(module).process_file(path, "global", "Port",
+        SshConfigEditor(module).process_file(path, "global", "Port",
                                              target_value="2222", state="present")
         assert read(path) == "Port 2222\n", "a valid change must still be applied"
         assert module.failures == []
@@ -434,7 +434,7 @@ class TestValidation:
     def test_validation_can_be_disabled(self, tmp_path):
         module = FakeModule(validate="")
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(module).process_file(path, "global", "Port",
+        SshConfigEditor(module).process_file(path, "global", "Port",
                                              target_value="2222", state="present")
         assert module.commands == []
         assert read(path) == "Port 2222\n"
@@ -442,7 +442,7 @@ class TestValidation:
     def test_a_custom_command_is_used_verbatim(self, tmp_path):
         module = FakeModule(validate="/opt/sshd -t -f %s")
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(module).process_file(path, "global", "Port",
+        SshConfigEditor(module).process_file(path, "global", "Port",
                                              target_value="2222", state="present")
         assert module.commands[0].startswith("/opt/sshd -t -f ")
 
@@ -451,7 +451,7 @@ class TestValidation:
         module = FakeModule(validate="/usr/sbin/sshd -t")
         path = write(tmp_path / "sshd_config", "Port 22\n")
         with pytest.raises(AssertionError):
-            FileManipulator(module).process_file(path, "global", "Port",
+            SshConfigEditor(module).process_file(path, "global", "Port",
                                                  target_value="2222", state="present")
         assert "%s" in module.failures[0]["msg"]
 
@@ -459,7 +459,7 @@ class TestValidation:
         """Nothing is written, so there is no candidate to check."""
         module = FakeModule(check_mode=True)
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(module).process_file(path, "global", "Port",
+        SshConfigEditor(module).process_file(path, "global", "Port",
                                              target_value="2222", state="present")
         assert module.commands == []
 
@@ -474,7 +474,7 @@ class TestCumulativeValues:
 
     def test_a_list_becomes_one_line_per_value(self, tmp_path):
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(FakeModule()).insert_new_option(
+        SshConfigEditor(FakeModule()).insert_new_option(
             path, "global", "ListenAddress", ["10.0.0.1", "10.0.0.2"])
         out = read(path)
         assert "ListenAddress 10.0.0.1\n" in out
@@ -484,14 +484,14 @@ class TestCumulativeValues:
     def test_a_single_string_still_works(self, tmp_path):
         """The shadowed case is unchanged - this is an addition, not a migration."""
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(FakeModule()).insert_new_option(
+        SshConfigEditor(FakeModule()).insert_new_option(
             path, "global", "PermitRootLogin", "no")
         assert read(path) == "Port 22\nPermitRootLogin no\n"
 
     def test_a_list_lands_before_the_first_match_too(self, tmp_path):
         """The scoping trap applies to every value, not just the first."""
         path = write(tmp_path / "sshd_config", "Match User bob\n    X11Forwarding no\n")
-        FileManipulator(FakeModule()).insert_new_option(
+        SshConfigEditor(FakeModule()).insert_new_option(
             path, "global", "ListenAddress", ["10.0.0.1", "10.0.0.2"])
         out = read(path).splitlines()
         assert out[0] == "ListenAddress 10.0.0.1"
@@ -500,14 +500,14 @@ class TestCumulativeValues:
 
     def test_a_list_inside_a_new_match_block_is_indented(self, tmp_path):
         path = write(tmp_path / "sshd_config", "Port 22\n")
-        FileManipulator(FakeModule()).insert_new_option(
+        SshConfigEditor(FakeModule()).insert_new_option(
             path, "User bob", "AcceptEnv", ["LANG", "LC_ALL"])
         out = read(path)
         assert "Match User bob\n    AcceptEnv LANG\n    AcceptEnv LC_ALL" in out
 
     def test_a_list_inside_an_existing_match_block(self, tmp_path):
         path = write(tmp_path / "sshd_config", "Match User bob\n    X11Forwarding no\n")
-        FileManipulator(FakeModule()).insert_new_option(
+        SshConfigEditor(FakeModule()).insert_new_option(
             path, "User bob", "AcceptEnv", ["LANG", "LC_ALL"])
         out = read(path).splitlines()
         assert out[1] == "    AcceptEnv LANG"
@@ -521,7 +521,7 @@ class TestCumulativeValues:
             "ListenAddress 10.0.0.2\n"
             "Port 22\n"
         ))
-        FileManipulator(FakeModule()).process_file(path, "global", "ListenAddress",
+        SshConfigEditor(FakeModule()).process_file(path, "global", "ListenAddress",
                                                    state="absent")
         out = read(path)
         assert out.count("# ListenAddress") == 2
@@ -536,7 +536,7 @@ class TestCumulativeSetSemantics:
     """
 
     def test_replacing_a_set_removes_what_is_no_longer_declared(self, tmp_path):
-        manipulator = FileManipulator(FakeModule())
+        manipulator = SshConfigEditor(FakeModule())
         path = write(tmp_path / "sshd_config", (
             "ListenAddress 10.0.0.1\n"
             "ListenAddress 10.0.0.2\n"
@@ -550,3 +550,215 @@ class TestCumulativeSetSemantics:
                   if l.startswith("ListenAddress")]
         assert active == ["ListenAddress 10.0.0.1", "ListenAddress 10.0.0.9"]
         assert read(path).count("# ListenAddress") == 3, "the old three are commented out"
+
+
+class TestEqualsSpellings:
+    """sshd accepts `Key Value`, `Key=Value`, `Key = Value` and `Key =Value`.
+
+    aursu.general's parser handles all four. Until now the writer handled only
+    the first, which made the two halves disagree: the parser reported the
+    directive present, the writer could not find it, and the module reported
+    changed: false having done nothing. Silently doing nothing is the worst
+    failure mode for a tool you trust to harden a host.
+    """
+
+    @pytest.mark.parametrize("raw", [
+        "Port 22\n", "Port=22\n", "Port = 22\n", "Port =22\n", "Port= 22\n",
+    ])
+    def test_key_and_value_are_extracted_from_every_spelling(self, raw):
+        line = SshLine.create(raw)
+        assert isinstance(line, ConfigLine)
+        assert line.key == "Port"
+        assert line.value == "22"
+
+    def test_match_with_equals_is_a_match_line(self, raw=None):
+        """`Match=User bob` used to classify as a ConfigLine, so scope never
+        changed and a global edit could rewrite a Match-scoped option."""
+        line = SshLine.create("Match=User bob\n")
+        assert isinstance(line, MatchLine)
+        assert line.scope == "User bob"
+
+    def test_a_directive_merely_starting_with_match_is_not_a_match_line(self):
+        """Routing happens on the normalised key, so this is correct by
+        construction rather than by a special case. The test stays because the
+        obvious implementations - matching a prefix, or looking at the raw token
+        before the separator is normalised - both get it wrong."""
+        assert isinstance(SshLine.create("MatchingFoo yes\n"), ConfigLine)
+
+
+class TestUpdatePreservesStyle:
+    """An edit must not restyle the line it touches.
+
+    Recognising `Port=22` is only half the fix: writing it back as `Port 2222`
+    would silently reformat files the module was asked only to change a value in.
+    """
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("Port 22\n", "Port 2222\n"),
+        ("Port=22\n", "Port=2222\n"),
+        ("Port = 22\n", "Port = 2222\n"),
+        ("Port =22\n", "Port =2222\n"),
+        ("Port= 22\n", "Port= 2222\n"),
+        ("    Port 22\n", "    Port 2222\n"),
+        ("Port\t22\n", "Port\t2222\n"),
+    ])
+    def test_separator_and_indentation_survive(self, raw, expected):
+        line = SshLine.create(raw)
+        line.update("2222")
+        assert line.render() == expected
+
+    def test_a_key_with_no_value_still_gets_a_separator(self):
+        """The edge case the index walk falls into: with nothing to skip past, a
+        naive implementation concatenates and emits `Port2222`."""
+        line = SshLine.create("Port\n")
+        line.update("2222")
+        assert line.render() == "Port 2222\n"
+
+    def test_the_key_capitalisation_in_the_file_is_kept(self):
+        line = SshLine.create("PORT=22\n")
+        line.update("2222")
+        assert line.render() == "PORT=2222\n"
+
+
+class TestEqualsSpellingsEndToEnd:
+    """The bug as it actually bit: through process_file and insert_new_option."""
+
+    def test_an_equals_written_directive_is_found_and_updated(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "Port=22\n")
+        SshConfigEditor(FakeModule()).process_file(path, "global", "Port",
+                                                   target_value="2222", state="present")
+        assert read(path) == "Port=2222\n"
+
+    def test_scope_is_tracked_across_a_match_with_equals(self, tmp_path):
+        """A global edit must not reach into `Match=User bob`."""
+        path = write(tmp_path / "sshd_config", (
+            "X11Forwarding yes\n"
+            "Match=User bob\n"
+            "    X11Forwarding yes\n"
+        ))
+        SshConfigEditor(FakeModule()).process_file(path, "global", "X11Forwarding",
+                                                   target_value="no", state="present")
+        out = read(path).splitlines()
+        assert out[0] == "X11Forwarding no"
+        assert out[2] == "    X11Forwarding yes", "the Match-scoped one must survive"
+
+    def test_insertion_finds_a_match_block_written_with_equals(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "Match=User bob\n    X11Forwarding no\n")
+        SshConfigEditor(FakeModule()).insert_new_option(
+            path, "User bob", "PasswordAuthentication", "no")
+        out = read(path).splitlines()
+        assert out[1] == "    PasswordAuthentication no", "must go inside the block"
+        assert "Match User bob" not in read(path), "must not create a second block"
+
+    def test_removal_finds_an_equals_written_directive(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "PermitRootLogin=yes\n")
+        SshConfigEditor(FakeModule()).process_file(path, "global", "PermitRootLogin",
+                                                   state="absent")
+        assert read(path).startswith("# PermitRootLogin=yes # Removed by Ansible")
+
+
+class TestFileEndings:
+    """Appending a Match block to the end of a file.
+
+    Two concerns that look like one: a file whose last line has no newline must
+    get one, and a blank line belongs before the new block only when there is
+    content to separate it from. Handling only the second concatenates the header
+    onto the last line; handling only the first loses the separator.
+    """
+
+    def test_a_file_with_no_trailing_newline_is_terminated_first(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "# end of file")
+        SshConfigEditor(FakeModule()).insert_new_option(
+            path, "User carol", "X11Forwarding", "no")
+        out = read(path)
+        assert "fileMatch" not in out, "the header must not be glued to the last line"
+        assert out.startswith("# end of file\n")
+
+    def test_a_whitespace_only_unterminated_last_line(self, tmp_path):
+        """The case the obvious `if lines[-1].strip()` check gets wrong: falsy,
+        so no separator is added, and the header lands on the same line."""
+        path = write(tmp_path / "sshd_config", "Port 22\n   ")
+        SshConfigEditor(FakeModule()).insert_new_option(
+            path, "User carol", "X11Forwarding", "no")
+        out = read(path)
+        assert "   Match" not in out, "the header must not be glued to the blank line"
+        assert "Match User carol" in out
+
+    def test_a_blank_line_still_separates_the_new_block(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        SshConfigEditor(FakeModule()).insert_new_option(
+            path, "User carol", "X11Forwarding", "no")
+        assert read(path) == "Port 22\n\nMatch User carol\n    X11Forwarding no\n"
+
+    def test_an_empty_file_gets_no_leading_blank_line(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "")
+        SshConfigEditor(FakeModule()).insert_new_option(
+            path, "User carol", "X11Forwarding", "no")
+        assert read(path).startswith("Match User carol")
+
+
+class TestValidationCommandQuoting:
+    def test_a_candidate_path_with_a_space_is_passed_as_one_argument(self, tmp_path):
+        """config_path may sit in a directory with a space. The temp file is
+        created beside it, so an unquoted path splits into two arguments and sshd
+        is handed a directory - refusing a change that was perfectly valid."""
+        import shlex as _shlex
+        d = tmp_path / "ssh config"
+        d.mkdir()
+        module = FakeModule()
+        path = write(d / "sshd_config", "Port 22\n")
+        SshConfigEditor(module).process_file(path, "global", "Port",
+                                             target_value="2222", state="present")
+        argv = _shlex.split(module.commands[0])
+        assert len(argv) == 4, "expected sshd -t -f <one path>, got %r" % (argv,)
+        assert " " in argv[3], "the path really does contain the space"
+
+
+class TestNonAsciiContent:
+    """A config may legitimately contain non-ASCII - a name in a comment, say.
+
+    The read side has always forced utf-8; the write side used the locale
+    default. On a host under the C locale with PEP 538 coercion disabled that is
+    ASCII, so such a file reads fine and crashes on write. This test passes
+    either way under a utf-8 locale; it bites when the suite is run with
+    PYTHONCOERCECLOCALE=0 and LC_ALL=C, which is how the bug was reproduced.
+    """
+
+    def test_a_non_ascii_comment_survives_an_edit(self, tmp_path):
+        original = "# Kontakt: Björn Müller\nPort 22\n"
+        path = write(tmp_path / "sshd_config", original)
+        SshConfigEditor(FakeModule()).process_file(path, "global", "Port",
+                                                   target_value="2222", state="present")
+        out = read(path)
+        assert "Björn Müller" in out
+        assert "Port 2222\n" in out
+
+
+class TestNonStringValues:
+    """`type: raw` hands us whatever YAML resolved, so `value: 22` arrives as an
+    int while everything parsed out of the file is a string.
+
+    The loud failure is a TypeError, and it needs a mixed list. The quiet one is
+    worse and far more likely: an int never compares equal to the string in the
+    file, so the module rewrites it and reports changed on every single run.
+    """
+
+    def test_an_integer_value_is_idempotent(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        manipulator = SshConfigEditor(FakeModule())
+        manipulator.process_file(path, "global", "Port", target_value=22, state="present")
+        assert manipulator.diffs == [], "22 and '22' are the same setting"
+        assert read(path) == "Port 22\n"
+
+    def test_an_integer_value_that_differs_is_still_applied(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        SshConfigEditor(FakeModule()).process_file(path, "global", "Port",
+                                                   target_value=2222, state="present")
+        assert read(path) == "Port 2222\n"
+
+    def test_a_boolean_value_is_rendered_as_yaml_wrote_it(self, tmp_path):
+        """`value: no` unquoted is a bool in YAML. It must not land as 'False'."""
+        path = write(tmp_path / "sshd_config", "X11Forwarding yes\n")
+        SshConfigEditor(FakeModule()).process_file(path, "global", "X11Forwarding",
+                                                   target_value=False, state="present")
+        assert "False" not in read(path), "a Python bool must not reach the file"

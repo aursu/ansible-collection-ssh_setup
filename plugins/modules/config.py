@@ -1,13 +1,10 @@
 #!/usr/bin/python
-# -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false
 # pylint: disable=import-error
 
 # Copyright (c) 2026 Alexander Ursu <alexander.ursu@gmail.com>
 # SPDX-License-Identifier: MIT
 
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
 
 import os
 import shlex
@@ -19,6 +16,7 @@ from ansible.module_utils.basic import AnsibleModule
 try:
     from ansible_collections.aursu.general.plugins.module_utils.ssh_parser import (
         CUMULATIVE_DIRECTIVES,
+        SEPARATOR,
         SshConfigParser,
     )
 except ImportError:
@@ -26,6 +24,7 @@ except ImportError:
     # In production, this will trigger an Ansible error, which is the correct behavior.
     SshConfigParser = None
     CUMULATIVE_DIRECTIVES = frozenset()
+    SEPARATOR = "="  # only for the import-failure path; main() fails before use
 
 DOCUMENTATION = r"""
 module: config
@@ -78,6 +77,8 @@ options:
     description:
       - Command used to check the candidate file before it replaces the real one.
       - Must contain C(%s), which is replaced by the path of the temporary file.
+      - Do not quote C(%s) yourself - the module quotes it, so a path containing
+        a space is passed as one argument. Quoting again passes sshd a literal quote.
       - Defaults to C(sshd -t -f %s), located with the module's usual binary search.
       - Set to an empty string to skip validation entirely. Doing so on a host with
         no console is how a configuration that prevents sshd starting ends access
@@ -153,6 +154,23 @@ diff:
   type: list
 """
 
+def as_config_text(value):
+    """Render a value the way sshd_config spells it.
+
+    `type: raw` hands the module whatever YAML resolved, so `value: 22` arrives
+    as an int and `value: no` as a bool, while everything read back out of a file
+    is a string. Comparing the two never matches, and the module would rewrite
+    the file and report changed on every run; a mixed list would raise TypeError
+    inside sorted().
+
+    Booleans are spelled the way sshd spells them. `value: no` unquoted is False
+    in YAML, and "False" is not a thing sshd understands.
+    """
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
 class SshLine:
     """
     Base class and factory for SSH configuration lines.
@@ -169,103 +187,156 @@ class SshLine:
     def diff(self):
         return self._diff_info
 
+    @staticmethod
+    def parse_directive(stripped_line):
+        """Split one line into its key and the remaining tokens.
+
+        sshd accepts "Key Value", "Key=Value", "Key = Value" and "Key =Value"
+        interchangeably. Normalising all four here, once, is what lets the
+        factory below route on a clean key - so `Match=User bob` is recognised as
+        a Match block by comparing the key to "match", with no prefix matching
+        and no special case.
+
+        Returns (None, []) for a line that cannot be lexed.
+        """
+        try:
+            parts = shlex.split(stripped_line)
+        except ValueError:
+            return None, []
+
+        if not parts:
+            return None, []
+
+        key = parts[0]
+        rest = parts[1:]
+
+        # "Key=Value" and "Key= Value": the separator is inside the first token.
+        if SEPARATOR in key:
+            key, _, first_val = key.partition(SEPARATOR)
+            if first_val:
+                rest = [first_val] + rest
+
+        # "Key = Value" lexes the separator alone; "Key =Value" leads with it.
+        elif rest and rest[0].startswith(SEPARATOR):
+            first_val = rest[0][len(SEPARATOR):]
+            rest = ([first_val] + rest[1:]) if first_val else rest[1:]
+
+        return key, rest
+
     @classmethod
     def create(cls, raw_line):
-        """
-        Factory method. Analyzes the line and returns an instance of the appropriate subclass.
-        """
+        """Return the right subclass for one raw line."""
         stripped = raw_line.strip()
 
-        # 1. Quick check for non-parseable content (comments, blank lines)
+        # Comments and blank lines are never touched.
         if not stripped or stripped.startswith('#'):
             return IgnoredLine(raw_line)
 
-        # 2. Attempt to parse structure to determine line type
-        try:
-            parts = shlex.split(stripped)
-        except ValueError:
-            # If quotes are unclosed or input is malformed
-            # treat as Ignored, do not break execution
+        # Normalise first, then decide. A malformed line - unbalanced quotes, or
+        # nothing but a separator - yields no key and is left verbatim.
+        key, rest = cls.parse_directive(stripped)
+        if not key:
             return IgnoredLine(raw_line)
 
-        if not parts:
-            return IgnoredLine(raw_line)
+        first_token = key.lower()
 
-        first_token = parts[0].lower()
-
-        # 3. Route by line type
         if first_token == 'match':
-            # Pass parts so MatchLine does not parse again
-            return MatchLine(raw_line, parts=parts)
+            return MatchLine(raw_line, key=key, rest=rest)
 
+        # An Include reads as `Key Value` and would otherwise be editable as an
+        # option; it is resolved by the parser, not rewritten here.
         if first_token == 'include':
             return IgnoredLine(raw_line)
 
-        # 4. All other cases are treated as configuration options
-        return ConfigLine(raw_line, parts=parts)
+        return ConfigLine(raw_line, key=key, rest=rest)
+
 
 class IgnoredLine(SshLine):
     """Lines that are not modified (comments, blank lines, includes, parse errors)."""
     pass
 
+
 class MatchLine(SshLine):
     """Match directive. Defines a scope context."""
 
-    def __init__(self, raw_content, parts=None):
+    def __init__(self, raw_content, key=None, rest=None):
         super().__init__(raw_content)
 
-        # If parts are provided (from Factory) — use them.
-        # If not provided (manual object creation in tests) — parse ourselves.
-        if parts is None:
-            try:
-                parts = shlex.split(raw_content.strip())
-            except ValueError:
-                parts = []
+        # key/rest come from the factory, which has already normalised the
+        # separator. Direct construction (tests, ad-hoc use) parses its own.
+        if key is None:
+            key, rest = SshLine.parse_directive(raw_content.strip())
+        rest = rest or []
 
-        # Now parts are guaranteed to exist, compute scope
-        if parts and len(parts) > 1:
-            val = " ".join(parts[1:])
+        if rest:
+            val = " ".join(rest)
+            # `Match All` returns to global scope; it is not a scope named "All".
             self.scope = "global" if val.lower() == "all" else val
         else:
-            # Fallback for malformed lines
+            # A Match with no condition is malformed - sshd rejects it. Treating
+            # it as global is the conservative reading: it cannot silently scope
+            # later options to a block that does not exist.
             self.scope = "global"
+
 
 class ConfigLine(SshLine):
     """Configuration option (Key Value pair)."""
-    def __init__(self, raw_content, parts=None):
+
+    def __init__(self, raw_content, key=None, rest=None):
         super().__init__(raw_content)
 
-        # 1. Compute indentation (fast operation, no shlex needed)
+        # Indentation is taken from the raw line, so an edit can put it back.
         self.indent = raw_content[:len(raw_content) - len(raw_content.lstrip())]
 
-        # 2. Extract tokens
-        if parts is None:
-            stripped = raw_content.strip()
-            try:
-                parts = shlex.split(stripped)
-            except ValueError:
-                parts = []
+        if key is None:
+            key, rest = SshLine.parse_directive(raw_content.strip())
+        rest = rest or []
 
-        # 3. Populate fields
-        if parts:
-            self.key = parts[0]
-            self.key_lower = self.key.lower()
-            self.value = " ".join(parts[1:])
-        else:
-            # Fallback for empty ConfigLine creation (unlikely, but for safety)
-            self.key = ""
-            self.key_lower = ""
-            self.value = ""
+        self.key = key or ""
+        self.key_lower = self.key.lower()
+        self.value = " ".join(rest)
 
     def update(self, new_value):
+        """Replace the value, leaving everything else about the line alone.
+
+        The separator is preserved rather than normalised: a file written as
+        `Port=22` stays `Port=2222`, and one written `Port = 22` keeps its
+        spaces. Regenerating the line instead would silently restyle files the
+        caller asked only to change a value in - and this module exists to
+        preserve structure.
+        """
+        # Coerced here as well as at the module boundary: this class is used
+        # directly, and a comparison of "22" against 22 would silently report a
+        # change on every run.
+        new_value = as_config_text(new_value)
+
         if self.value == new_value:
             return False
 
         old_val = self.value
         self.value = new_value
         self.modified = True
-        # Regenerate the line
-        self.raw = f"{self.indent}{self.key} {self.value}\n"
+
+        # Walk past the key and whatever separates it from the value, so the
+        # original spacing and any '=' survive verbatim.
+        idx = len(self.indent) + len(self.key)
+        length = len(self.raw)
+        start = idx
+
+        while idx < length and self.raw[idx] in (' ', '\t'):
+            idx += 1
+        if idx < length and self.raw[idx] == SEPARATOR:
+            idx += 1
+        while idx < length and self.raw[idx] in (' ', '\t'):
+            idx += 1
+
+        if idx == start:
+            # No separator at all - a key on its own line. Concatenating here
+            # would emit 'Port2222'; supply the space the line never had.
+            self.raw = self.raw[:start].rstrip() + ' ' + str(new_value) + '\n'
+        else:
+            self.raw = self.raw[:idx] + str(new_value) + '\n'
+
         self._diff_info = {'action': 'update', 'val': new_value, 'old_val': old_val}
         return True
 
@@ -274,7 +345,7 @@ class ConfigLine(SshLine):
         self.modified = True
         self._diff_info = {'action': 'remove', 'content': self.key}
 
-class FileManipulator:
+class SshConfigEditor:
     """
     File manipulation handler. Responsible exclusively for stream-based file editing.
     Does not make decisions about which file to modify, simply executes commands.
@@ -356,13 +427,13 @@ class FileManipulator:
         # effect. Each element becomes its own line: that is how sshd expresses a
         # set, and joining them onto one line would mean something else entirely.
         values = value if isinstance(value, list) else [value]
-        new_lines = [f"{key} {v}\n" for v in values]
+        new_lines = [f"{key} {as_config_text(v)}\n" for v in values]
 
         if condition == "global":
             # Determine insertion point (before first Match to avoid inserting inside a block)
             insert_idx = len(lines)
             for i, line in enumerate(lines):
-                if line.strip().lower().startswith('match '):
+                if isinstance(SshLine.create(line), MatchLine):
                     insert_idx = i
                     break
             lines[insert_idx:insert_idx] = new_lines
@@ -371,17 +442,13 @@ class FileManipulator:
             # Search for Match block header
             match_found = False
             for i, line in enumerate(lines):
-                stripped = line.strip().lower()
-                # Simplified header check
-                if stripped.startswith('match '):
-                    # Parse precisely to verify condition
-                    try:
-                        parts = shlex.split(line.strip())
-                        block_scope = " ".join(parts[1:])
-                    except ValueError:
-                        continue
-
-                    if block_scope == condition:
+                # Classify with the same factory the rest of the module uses,
+                # rather than re-implementing the parse here. That removes a
+                # second place to keep in step, and it recognises `Match=cond`
+                # for free.
+                header = SshLine.create(line)
+                if isinstance(header, MatchLine):
+                    if header.scope == condition:
                         # Block found! Insert immediately after header with indentation
                         lines[i + 1:i + 1] = [f"    {line}" for line in new_lines]
                         match_found = True
@@ -390,6 +457,13 @@ class FileManipulator:
 
             if not match_found:
                 # Block does not exist -> create new block at end of file
+                # Two separate concerns, and conflating them is how this goes wrong.
+                # First: a file whose last line has no newline must get one, or the
+                # header is concatenated onto it. Second: a blank line before the
+                # block, but only when there is content to separate it from.
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] += "\n"
+                
                 prefix = "\n" if lines and lines[-1].strip() else ""
                 body = "".join(f"    {line}" for line in new_lines)
                 lines.append(f"{prefix}Match {condition}\n{body}")
@@ -429,7 +503,12 @@ class FileManipulator:
         if '%s' not in command:
             self.module.fail_json(msg="validate must contain %s, the candidate file path")
 
-        rc, _stdout, stderr = self.module.run_command(command % candidate_path)
+        # Quoted because the temp file sits beside config_path, and a path
+        # containing a space would otherwise split into two arguments - sshd
+        # would be handed a directory and refuse a change that was valid.
+        # Callers must therefore NOT quote %s in their own validate template;
+        # quoting twice passes sshd a literal quote.
+        rc, _stdout, stderr = self.module.run_command(command % shlex.quote(candidate_path))
         if rc == 0:
             return
 
@@ -462,7 +541,11 @@ class FileManipulator:
 
         tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_path, text=True)
         try:
-            with os.fdopen(tmp_fd, 'w') as f:
+            # encoding forced to match the read side. Without it the stream uses
+            # the locale default, which is ASCII under the C locale with PEP 538
+            # coercion disabled - measured. A config with a non-ASCII comment then
+            # reads fine and crashes on write.
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
                 f.writelines(lines)
             # Validate the CANDIDATE while the real file is still in place, so a
             # rejected change is a change that never happened - rather than one
@@ -501,6 +584,21 @@ def main():
     state = module.params["state"]
     base_dir = os.path.dirname(config_path)
 
+    # `type: raw` hands us whatever YAML resolved, so `value: 22` arrives as an
+    # int and `value: no` as a bool, while everything read out of the file is a
+    # string. Comparing the two never matches, so the module would rewrite the
+    # file and report changed on EVERY run - and a mixed list would raise
+    # TypeError inside sorted(). Normalising once here covers both the scalar and
+    # the list path; doing it only where the lists are compared would leave the
+    # commoner scalar case broken.
+    #
+    # Booleans are rendered the way sshd spells them, not the way Python does:
+    # `value: no` unquoted is False in YAML and must not reach the file as "False".
+    if isinstance(value, list):
+        value = [as_config_text(v) for v in value]
+    elif value is not None:
+        value = as_config_text(value)
+
     if state == "present" and value is None:
         module.fail_json(msg="parameter \"value\" is required when state is \"present\"")
 
@@ -521,9 +619,10 @@ def main():
 
     # Helper to extract metadata from the structure
     if condition == "global":
-        if key in full_data and isinstance(full_data[key], dict):
-            option_location = full_data[key].get('location')
-            option_appearance = full_data[key].get('appearance', [])
+        entry = full_data.get(key)
+        if isinstance(entry, dict):
+            option_location = entry.get('location')
+            option_appearance = entry.get('appearance', [])
     else:
         # Search within Match blocks
         match_blocks = full_data.get('Match', [])
@@ -555,11 +654,12 @@ def main():
 
     existing_values = []
     if condition == "global":
-        if key in full_data and isinstance(full_data[key], dict):
-            raw = full_data[key].get('value')
+        entry = full_data.get(key)
+        if isinstance(entry, dict):
+            raw = entry.get('value')
             existing_values = raw if isinstance(raw, list) else ([raw] if raw else [])
 
-    manipulator = FileManipulator(module)
+    manipulator = SshConfigEditor(module)
 
     if state == "absent":
         if option_appearance:

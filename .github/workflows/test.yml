@@ -33,6 +33,22 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m pytest tests/unit -q
 
+      # Again under an ASCII locale. The module writes sshd_config, which may
+      # contain non-ASCII - a name in a comment - and a stream opened without an
+      # explicit encoding uses the locale default. PEP 538 coercion normally
+      # hides that, so the bug only appears where coercion is off: a minimal
+      # container or a stripped CI runner. One of these tests is silent under
+      # utf-8 and fails here.
+      - name: Unit tests under a C/ASCII locale
+        working-directory: ansible_collections/aursu/ssh_setup
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          LC_ALL: C
+          LANG: C
+          PYTHONCOERCECLOCALE: '0'
+          PYTHONUTF8: '0'
+        run: python -m pytest tests/unit -q
+
   docs:
     name: module documentation
     runs-on: ubuntu-latest
