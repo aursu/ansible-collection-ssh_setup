@@ -17,11 +17,15 @@ from ansible.module_utils.basic import AnsibleModule
 # --- PARSER IMPORT (FROM SIBLING COLLECTION) ---
 # The parser is used exclusively for reading and decision-making.
 try:
-    from ansible_collections.aursu.general.plugins.module_utils.ssh_parser import SshConfigParser
+    from ansible_collections.aursu.general.plugins.module_utils.ssh_parser import (
+        CUMULATIVE_DIRECTIVES,
+        SshConfigParser,
+    )
 except ImportError:
     # Fallback for local debugging or if the collection is not properly installed.
     # In production, this will trigger an Ansible error, which is the correct behavior.
     SshConfigParser = None
+    CUMULATIVE_DIRECTIVES = frozenset()
 
 DOCUMENTATION = r"""
 module: config
@@ -37,8 +41,19 @@ options:
     type: str
     required: true
   value:
-    description: The value to set. Required if state is present.
-    type: str
+    description:
+      - The value to set. Required when I(state=present).
+      - May be a B(list) for the nine cumulative directives - C(Port),
+        C(ListenAddress), C(HostKey), C(AcceptEnv), C(AllowUsers), C(DenyUsers),
+        C(AllowGroups), C(DenyGroups) and C(Subsystem) - where every occurrence
+        takes effect rather than only the first.
+      - A list is declarative and means the COMPLETE set - values not listed are
+        removed. That is the operation a single string cannot express. You can add
+        one C(ListenAddress), but you cannot say I(these two and no others).
+      - A list for any other directive is refused. Those are shadowed, so only the
+        first occurrence would apply and the rest would be silently dead.
+      - Lists are supported in the C(global) scope only.
+    type: raw
   condition:
     description: The Match condition block (e.g., 'User bob'). Use 'global' for global options.
     type: str
@@ -48,7 +63,11 @@ options:
     type: path
     default: "/etc/ssh/sshd_config"
   state:
-    description: Whether the option should be present or absent.
+    description:
+      - Whether the option should be present or absent.
+      - C(absent) removes B(every) occurrence of the directive, in every file it
+        appears in. For a cumulative directive that means the whole set goes, not
+        one member of it.
     choices: [present, absent]
     default: present
   backup:
@@ -107,6 +126,16 @@ EXAMPLES = r"""
 #     ansible.builtin.service:
 #       name: sshd
 #       state: reloaded
+
+# Cumulative directives take a list, and the list is the complete set:
+# exactly these two addresses, any other ListenAddress removed.
+- name: Bind sshd to two addresses and no others
+  aursu.ssh_setup.config:
+    key: ListenAddress
+    value:
+      - 10.0.0.1
+      - 10.0.0.2
+  notify: reload sshd
 
 # Skip validation only where sshd is genuinely unavailable - a container image
 # being built, say. Never on a host you cannot get a console to.
@@ -323,7 +352,11 @@ class FileManipulator:
             except IOError:
                 self.module.fail_json(msg=f"Cannot read file for insertion: {filepath}")
 
-        new_line = f"{key} {value}\n"
+        # A list, for the cumulative directives where every occurrence takes
+        # effect. Each element becomes its own line: that is how sshd expresses a
+        # set, and joining them onto one line would mean something else entirely.
+        values = value if isinstance(value, list) else [value]
+        new_lines = [f"{key} {v}\n" for v in values]
 
         if condition == "global":
             # Determine insertion point (before first Match to avoid inserting inside a block)
@@ -332,7 +365,7 @@ class FileManipulator:
                 if line.strip().lower().startswith('match '):
                     insert_idx = i
                     break
-            lines.insert(insert_idx, new_line)
+            lines[insert_idx:insert_idx] = new_lines
             self.diffs.append({'file': filepath, 'action': 'insert_global', 'val': value})
         else:
             # Search for Match block header
@@ -350,7 +383,7 @@ class FileManipulator:
 
                     if block_scope == condition:
                         # Block found! Insert immediately after header with indentation
-                        lines.insert(i + 1, f"    {new_line}")
+                        lines[i + 1:i + 1] = [f"    {line}" for line in new_lines]
                         match_found = True
                         self.diffs.append({'file': filepath, 'action': 'insert_match', 'val': value})
                         break
@@ -358,7 +391,8 @@ class FileManipulator:
             if not match_found:
                 # Block does not exist -> create new block at end of file
                 prefix = "\n" if lines and lines[-1].strip() else ""
-                lines.append(f"{prefix}Match {condition}\n    {new_line}")
+                body = "".join(f"    {line}" for line in new_lines)
+                lines.append(f"{prefix}Match {condition}\n{body}")
                 self.diffs.append({'file': filepath, 'action': 'new_block', 'val': value})
 
         self._write_atomic(filepath, lines)
@@ -445,7 +479,7 @@ def main():
         argument_spec=dict(
             config_path=dict(type="path", default="/etc/ssh/sshd_config"),
             key=dict(type="str", required=True),
-            value=dict(type="str", required=False),
+            value=dict(type="raw", required=False),
             condition=dict(type="str", default="global"),
             state=dict(type="str", choices=["present", "absent"], default="present"),
             backup=dict(type="bool", default=False),
@@ -500,6 +534,31 @@ def main():
                 option_location = opts[key].get('location')
                 option_appearance = opts[key].get('appearance', [])
 
+    # Whether this directive is one of the nine where every occurrence applies.
+    # Taken from aursu.general, which measured the list with `sshd -T` rather than
+    # inferring it - SetEnv, PermitOpen and PermitListen read as list-like and are
+    # NOT in it.
+    is_cumulative = key.lower() in CUMULATIVE_DIRECTIVES
+
+    if isinstance(value, list) and not is_cumulative:
+        module.fail_json(
+            msg="value may only be a list for a cumulative directive; %s is "
+                "shadowed, so only its first occurrence would take effect. "
+                "Cumulative directives are: %s"
+                % (key, ", ".join(sorted(CUMULATIVE_DIRECTIVES))))
+
+    if isinstance(value, list) and condition != "global":
+        module.fail_json(
+            msg="a list value is supported in the global scope only; sshd permits "
+                "few of the cumulative directives inside a Match block, and "
+                "reconciling a set there is not implemented rather than guessed at")
+
+    existing_values = []
+    if condition == "global":
+        if key in full_data and isinstance(full_data[key], dict):
+            raw = full_data[key].get('value')
+            existing_values = raw if isinstance(raw, list) else ([raw] if raw else [])
+
     manipulator = FileManipulator(module)
 
     if state == "absent":
@@ -509,7 +568,26 @@ def main():
                 manipulator.process_file(fpath, condition, key, state="absent")
 
     elif state == "present":
-        if option_location:
+        # Cumulative directives are not shadowed: every occurrence takes effect,
+        # so a single "the value" is the wrong shape for them. The declared list
+        # is the COMPLETE set - anything else present is removed - which is the
+        # operation an audit wants and the one a string value cannot express.
+        if is_cumulative:
+            declared = value if isinstance(value, list) else [value]
+
+            # Idempotence is at the level of the set, not the file. Same members,
+            # in any order, means nothing to do - otherwise every run would churn
+            # the file and report changed forever.
+            if sorted(existing_values) == sorted(declared):
+                module.exit_json(changed=False)
+
+            for fpath in option_appearance:
+                manipulator.process_file(fpath, condition, key, state="absent")
+
+            target = option_location or config_path
+            manipulator.insert_new_option(target, condition, key, declared)
+
+        elif option_location:
             # Scenario A: Option ALREADY exists.
             # 1. Update the "winner" (effective location)
             manipulator.process_file(option_location, condition, key, target_value=value, state="present")

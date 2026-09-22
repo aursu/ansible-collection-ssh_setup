@@ -50,7 +50,11 @@ tags:
 # L(specifiers,https://python-semanticversion.readthedocs.io/en/latest/#requirement-specification). Multiple version
 # range specifiers can be set and are separated by ','
 dependencies:
-  "aursu.general": ">=1.5.0"
+  # >=1.7.0, not >=1.5.0: the module now imports CUMULATIVE_DIRECTIVES from the
+  # parser, and reads the list-typed `value` that 1.7.0 introduced for cumulative
+  # directives. A floor lower than what the code actually needs is the same class
+  # of defect as declaring no dependency at all.
+  "aursu.general": ">=1.7.0"
 
 # The URL of the originating SCM repository
 repository: https://github.com/aursu/ansible-collection-ssh_setup.git

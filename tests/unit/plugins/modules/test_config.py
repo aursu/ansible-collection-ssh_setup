@@ -462,3 +462,91 @@ class TestValidation:
         FileManipulator(module).process_file(path, "global", "Port",
                                              target_value="2222", state="present")
         assert module.commands == []
+
+
+class TestCumulativeValues:
+    """A list of values for a directive where every occurrence takes effect.
+
+    The writer must emit one line per value. Joining them onto a single line
+    would either mean something different to sshd or nothing at all, and is the
+    obvious wrong implementation.
+    """
+
+    def test_a_list_becomes_one_line_per_value(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        FileManipulator(FakeModule()).insert_new_option(
+            path, "global", "ListenAddress", ["10.0.0.1", "10.0.0.2"])
+        out = read(path)
+        assert "ListenAddress 10.0.0.1\n" in out
+        assert "ListenAddress 10.0.0.2\n" in out
+        assert "ListenAddress 10.0.0.1 10.0.0.2" not in out, "must not join onto one line"
+
+    def test_a_single_string_still_works(self, tmp_path):
+        """The shadowed case is unchanged - this is an addition, not a migration."""
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        FileManipulator(FakeModule()).insert_new_option(
+            path, "global", "PermitRootLogin", "no")
+        assert read(path) == "Port 22\nPermitRootLogin no\n"
+
+    def test_a_list_lands_before_the_first_match_too(self, tmp_path):
+        """The scoping trap applies to every value, not just the first."""
+        path = write(tmp_path / "sshd_config", "Match User bob\n    X11Forwarding no\n")
+        FileManipulator(FakeModule()).insert_new_option(
+            path, "global", "ListenAddress", ["10.0.0.1", "10.0.0.2"])
+        out = read(path).splitlines()
+        assert out[0] == "ListenAddress 10.0.0.1"
+        assert out[1] == "ListenAddress 10.0.0.2"
+        assert out[2] == "Match User bob"
+
+    def test_a_list_inside_a_new_match_block_is_indented(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "Port 22\n")
+        FileManipulator(FakeModule()).insert_new_option(
+            path, "User bob", "AcceptEnv", ["LANG", "LC_ALL"])
+        out = read(path)
+        assert "Match User bob\n    AcceptEnv LANG\n    AcceptEnv LC_ALL" in out
+
+    def test_a_list_inside_an_existing_match_block(self, tmp_path):
+        path = write(tmp_path / "sshd_config", "Match User bob\n    X11Forwarding no\n")
+        FileManipulator(FakeModule()).insert_new_option(
+            path, "User bob", "AcceptEnv", ["LANG", "LC_ALL"])
+        out = read(path).splitlines()
+        assert out[1] == "    AcceptEnv LANG"
+        assert out[2] == "    AcceptEnv LC_ALL"
+        assert out[3] == "    X11Forwarding no"
+
+    def test_removing_a_cumulative_directive_takes_every_occurrence(self, tmp_path):
+        """state: absent is the whole set, which is what was decided - not one member."""
+        path = write(tmp_path / "sshd_config", (
+            "ListenAddress 10.0.0.1\n"
+            "ListenAddress 10.0.0.2\n"
+            "Port 22\n"
+        ))
+        FileManipulator(FakeModule()).process_file(path, "global", "ListenAddress",
+                                                   state="absent")
+        out = read(path)
+        assert out.count("# ListenAddress") == 2
+        assert "Port 22\n" in out
+
+
+class TestCumulativeSetSemantics:
+    """The set-level reconciliation, tested through the same helpers main() uses.
+
+    These assert the property that makes a list declarative: after the module
+    runs, the file contains exactly the declared members and nothing else.
+    """
+
+    def test_replacing_a_set_removes_what_is_no_longer_declared(self, tmp_path):
+        manipulator = FileManipulator(FakeModule())
+        path = write(tmp_path / "sshd_config", (
+            "ListenAddress 10.0.0.1\n"
+            "ListenAddress 10.0.0.2\n"
+            "ListenAddress 10.0.0.3\n"
+        ))
+        # what main() does: clear every occurrence, then write the declared set
+        manipulator.process_file(path, "global", "ListenAddress", state="absent")
+        manipulator.insert_new_option(path, "global", "ListenAddress",
+                                      ["10.0.0.1", "10.0.0.9"])
+        active = [l for l in read(path).splitlines()
+                  if l.startswith("ListenAddress")]
+        assert active == ["ListenAddress 10.0.0.1", "ListenAddress 10.0.0.9"]
+        assert read(path).count("# ListenAddress") == 3, "the old three are commented out"

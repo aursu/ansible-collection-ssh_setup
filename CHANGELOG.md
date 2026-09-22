@@ -6,6 +6,51 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **Check mode.** `--check` previously refused to run the module at all, which was backwards: the
+  hosts where a preview matters most are the ones with no console. A check run now reports the
+  change it would make and writes nothing - not the file, not a backup, and not the directory a
+  new drop-in would need.
+
+- **`sshd -t` validation of the candidate file**, spelled `validate` after
+  `ansible.builtin.template`/`copy`/`lineinfile`. It runs against the temporary file while the
+  original is still in place, so a rejected change is one that never happened rather than one
+  rolled back after sshd has been handed a broken file.
+
+  The exit-code handling is the substance. Measured on OpenSSH 9.6p1: a syntactically valid file
+  run unprivileged exits **1** with `no hostkeys available`, while a bad directive or value exits
+  **255**. sshd checks syntax before it looks for host keys, so exit 1 there means the
+  configuration was accepted. The obvious implementation - treat any non-zero exit as failure -
+  would reject every valid file whenever host keys are unreadable.
+
+- **Cumulative directives accept a list.** `value` may be a list for the nine directives where
+  every occurrence takes effect, and the list is **declarative**: it is the complete set, and
+  values not listed are removed. Previously you could add one `ListenAddress` but could not say
+  *these two and no others*, which is the operation an audit actually wants.
+
+  The shape mirrors `aursu.general` 1.7.0's read side deliberately - one field, a string when the
+  directive is shadowed and a list when it is cumulative - so the reader and the writer do not
+  disagree. A list on a shadowed directive is refused rather than silently writing lines that
+  would never take effect. Idempotence is at the level of the set, so the same members in a
+  different order report no change.
+
+- **Unit tests**, 55 of them, over the file-manipulation layer. Each of four deliberate mutants
+  was checked to fail them before the suite was trusted.
+
+### Changed
+
+- **`aursu.general` floor raised to `>=1.7.0`** from `>=1.5.0`. The module now imports
+  `CUMULATIVE_DIRECTIVES` from the parser and reads the list-typed `value` that 1.7.0 introduced.
+  A floor lower than what the code needs is the same class of defect as declaring no dependency.
+
+- **`state: absent` documented as removing every occurrence**, in every file the directive appears
+  in. That was already the behaviour; for a cumulative directive it means the whole set goes.
+
+- **The module still does not reload sshd, and now says so.** Writing a file and restarting a
+  daemon are different decisions, and only the caller knows whether this is the last of several
+  options being set. Notify a handler - `changed` is reported so that works.
+
 ### Fixed
 
 - **The EXAMPLES named a collection that does not exist.** Both examples in
